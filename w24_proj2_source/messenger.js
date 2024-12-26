@@ -1,21 +1,20 @@
 'use strict'
 
 /** ******* Imports ********/
-const { subtle } = require('node:crypto').webcrypto;
 
 const {
   /* The following functions are all of the cryptographic
   primatives that you should need for this assignment.
   See lib.js for details on usage. */
-  bufferToString, // chuyen gia tri thanh day string co phan bo dong deu
-  genRandomSalt, // tao gia tri salt cong khai ngau nhien lam khoa HMAC
-  generateEG, // async 
+  bufferToString,
+  genRandomSalt,
+  generateEG, // async
   computeDH, // async
   verifyWithECDSA, // async
-  HMACtoAESKey, // async. dung de tao cac khoa cho qua trinh ma hoa và giai ma AES
-  HMACtoHMACKey, // async. dung de tao them khoa cho HMACs 
-  HKDF, // asynccl. su dung ham lay khoa HKDF voi gia tri salt de tao khoa cho phien bao mat
-  encryptWithGCM, // async.
+  HMACtoAESKey, // async
+  HMACtoHMACKey, // async
+  HKDF, // async
+  encryptWithGCM, // async
   decryptWithGCM,
   cryptoKeyToJSON, // async
   govEncryptionDataStr
@@ -28,14 +27,13 @@ class MessengerClient {
     // the certificate authority DSA public key is used to
     // verify the authenticity and integrity of certificates
     // of other users (see handout and receiveCertificate)
-
     // you can store data as needed in these objects.
     // Feel free to modify their structure as you see fit.
     this.caPublicKey = certAuthorityPublicKey
     this.govPublicKey = govPublicKey
     this.conns = {} // data for each active connection
     this.certs = {} // certificates of other users
-    this.EGKeyPair = {} // keypair from generateCertificate
+    this.EGKeyPair = null // keypair from generateCertificate
   }
 
   /**
@@ -48,14 +46,15 @@ class MessengerClient {
    * Return Type: certificate object/dictionary
    */
   async generateCertificate (username) {
-    const certificate = {};
-    certificate.username = username;
-    const key_pair = await generateEG();
-    certificate.pub_key = key_pair.pub;
-    
-    // this.conns.seenPks = new Set();
-    this.myKeyPairs = {cert_pk: key_pair.pub, cert_sk: key_pair.sec};
-    return certificate;
+    const keypairObject = await generateEG()
+    this.EGKeyPair = keypairObject
+
+    const certificate = {
+      username,
+      pub: keypairObject.pub
+    }
+
+    return certificate
   }
 
   /**
@@ -63,16 +62,20 @@ class MessengerClient {
  *
  * Arguments:
  *   certificate: certificate object/dictionary
- *   signature: ArrayBuffer
+ *   signature: string
  *
  * Return Type: void
  */
   async receiveCertificate (certificate, signature) {
-  //check this is a valid signature on the certificate
-
-    const valid = await verifyWithECDSA(this.caPublicKey, JSON.stringify(certificate), signature)
-    if(!valid) throw("invalid signature provided");
-    this.certs[certificate.username] = certificate;
+  // The signature will be on the output of stringifying the certificate
+  // rather than on the certificate directly.
+    const certString = JSON.stringify(certificate)
+    const valid = await verifyWithECDSA(this.caPublicKey, certString, signature)
+    if (valid) {
+      this.certs[certificate.username] = certificate
+    } else {
+      throw ('Tampered certificate!')
+    }
   }
 
   /**
@@ -82,57 +85,68 @@ class MessengerClient {
  *   name: string
  *   plaintext: string
  *
- * Return Type: Tuple of [dictionary, ArrayBuffer]
+ * Return Type: Tuple of [dictionary, string]
  */
   async sendMessage (name, plaintext) {
-    //generate rk / ck if user has not communicated with name before.
+    const cert = this.certs[name]
+
     if (!(name in this.conns)) {
-      const bob_public_key = this.certs[name].pub_key;
-
-      const raw_root_key = await computeDH(this.myKeyPairs.cert_sk, bob_public_key);
-
-      const fresh_pair = await generateEG();
-      this.myKeyPairs[name] = {pub_key: fresh_pair.pub, sec_key: fresh_pair.sec}; //to be updated further during DH ratchet in receiveMessage();
-
-      const hkdf_input_key = await computeDH(this.myKeyPairs[name].sec_key, bob_public_key); //const hkdf_input_key = await computeDH(this.myKeyPairs.sec_key, header.pk_sender);
-
-      const [root_key, chain_key] = await HKDF(hkdf_input_key, raw_root_key, "ratchet-salt");
-      
-      this.conns[name] = {rk: root_key, ck_s: chain_key};
-
-      this.conns[name].seenPks = new Set()
-
+      const rootkey = await computeDH(this.EGKeyPair.sec, cert.pub)
+      const connState = {
+        keypair: this.EGKeyPair,
+        next_root: rootkey,
+        recv_root: null,
+        prev_recv_root: null,
+        send_root: null,
+        recv_pub: cert.pub,
+        curr_sender: false,
+        send_cnt: 0,
+        recv_cnt: 0,
+        prev_recv_cnt: 0,
+        skipped: {}
+      }
+      this.conns[name] = connState
     }
-    //at this point we know we have a rk and ck_s
 
-    //ck_s is undefined because receive() is first called, which adds rk and ck_r but not ck_s
-    const ck_s = await HMACtoHMACKey(this.conns[name].ck_s, "ck-str");
-    const mk = await HMACtoAESKey(this.conns[name].ck_s, "mk-str");
-    const mk_buffer = await HMACtoAESKey(this.conns[name].ck_s, "mk-str", true);
-    this.conns[name].ck_s = ck_s; 
+    const connState = this.conns[name]
+    let send_cnt = connState.send_cnt
+    if (!connState.curr_sender) {
+      const keypair = await generateEG()
+      const computedDH = await computeDH(keypair.sec, connState.recv_pub)
+      const [next_root, send_root] = await HKDF(connState.next_root, computedDH, 'ratchet-str')
+      connState.keypair = keypair
+      connState.next_root = next_root
+      connState.send_root = send_root
+      connState.curr_sender = true
+      send_cnt = 0
+    }
 
-    //form header
-    const ivGov = genRandomSalt();
-    const receiver_iv = genRandomSalt();
-    const new_gov_pair = await generateEG();
+    const AES_key = await HMACtoAESKey(connState.send_root, 'AES')
+    connState.send_root = await HMACtoHMACKey(connState.send_root, 'HMAC')
+    connState.send_cnt = send_cnt + 1
 
-    //gov needs to be able to derive dh_secret given 1) govPublicKey and 2) new_gov_par.pub (vGov)
-    const dh_secret = await computeDH(new_gov_pair.sec, this.govPublicKey); // pub^sec --> (g^b)^a
-    const dh_secret_key = await HMACtoAESKey(dh_secret, "AES-generation"); //k = H(v, m) Since computeDH() output is configured with HMAC, need to run the output through HMACtoAESKey() to generate a key that can be used with AES-GCM
-    const cGov = await encryptWithGCM(dh_secret_key, mk_buffer, ivGov); 
-    
-    //form header 
-    const header = {vGov: new_gov_pair.pub, 
-      cGov: cGov, 
-      receiver_iv: receiver_iv, 
-      ivGov: ivGov,
-      pk_sender: this.myKeyPairs[name].pub_key 
-     }; 
+    const ivGov = genRandomSalt()
+    const govkeypair = await generateEG()
+    const govDH = await computeDH(govkeypair.sec, this.govPublicKey)
+    const govAES = await HMACtoAESKey(govDH, govEncryptionDataStr)
+    const keyJSON = await cryptoKeyToJSON(AES_key)
+    const cGov = await encryptWithGCM(govAES, Buffer.from(keyJSON.k, 'base64'), ivGov)
 
-    //encrypt message
-    const ciphertext = await encryptWithGCM(mk, plaintext, receiver_iv, JSON.stringify(header));
+    const salt = genRandomSalt()
 
-    return [header, ciphertext];
+    const header = {
+      pub: connState.keypair.pub,
+      vGov: govkeypair.pub,
+      cGov,
+      ivGov,
+      receiverIV: salt,
+      send_cnt
+    }
+
+    // encrypt
+    const header_string = JSON.stringify(header)
+    const ciphertext = await encryptWithGCM(AES_key, plaintext, salt, header_string)
+    return [header, ciphertext]
   }
 
   /**
@@ -140,63 +154,99 @@ class MessengerClient {
  *
  * Arguments:
  *   name: string
- *   [header, ciphertext]: Tuple of [dictionary, ArrayBuffer]
+ *   [header, ciphertext]: Tuple of [dictionary, string]
  *
  * Return Type: string
  */
-  async receiveMessage(name, [header, ciphertext]) {
-    
-    //If A has not previously communicated with B, setup the session by generating necessary double ratchet keys 
+  async receiveMessage (name, [header, ciphertext]) {
+    const cert = this.certs[name]
+
     if (!(name in this.conns)) {
-      const sender_cerk_pk = this.certs[name].pub_key;
-      const raw_root_key = await computeDH(this.myKeyPairs.cert_sk, sender_cerk_pk);
-      const hkdf_input_key = await computeDH(this.myKeyPairs.cert_sk, header.pk_sender);
-      const [root_key, chain_key] = await HKDF(hkdf_input_key, raw_root_key, "ratchet-salt");
+      const rootkey = await computeDH(this.EGKeyPair.sec, cert.pub)
 
-      const fresh_pair = await generateEG();
-      this.myKeyPairs[name] = {pub_key: fresh_pair.pub, sec_key: fresh_pair.sec};
-
-      const dh_result = await computeDH(this.myKeyPairs[name].sec_key, header.pk_sender);
-
-      const [final_root_key, ck_s] = await HKDF(dh_result, root_key, "ratchet-salt");
-    
-      this.conns[name] = {rk: final_root_key, ck_r: chain_key, ck_s: ck_s};
-
-      //create seen pks set
-      this.conns[name].seenPks = new Set()
-      
-
-    } else if (!(this.conns[name].seenPks.has(header.pk_sender))) {
-      //apply a DH ratchet because the sender is different than the last sender!
-      //apply DH ratchet
-      console.log("test")
-
-      const first_dh_output = await computeDH(this.myKeyPairs[name].sec_key, header.pk_sender);
-      let [rk_first, ck_r] = await HKDF(first_dh_output, this.conns[name].rk, "ratchet-salt"); //see Signal diagram
-
-      const fresh_pair = await generateEG();
-      this.myKeyPairs[name] = {pub_key: fresh_pair.pub, sec_key: fresh_pair.sec}
-
-      const second_dh_output = await computeDH(this.myKeyPairs[name].sec_key, header.pk_sender);
-      const [rk, ck_s] = await HKDF(second_dh_output, rk_first, "ratchet-salt"); //see Signal diagram
-      this.conns[name].rk = rk;
-      this.conns[name].ck_s = ck_s;
-      this.conns[name].ck_r = ck_r;
+      const connState = {
+        keypair: this.EGKeyPair,
+        next_root: rootkey,
+        recv_root: null,
+        prev_recv_root: null,
+        send_root: null,
+        recv_pub: cert.pub,
+        curr_sender: true,
+        send_cnt: 0,
+        recv_cnt: 0,
+        prev_recv_cnt: 0,
+        skipped: {}
+      }
+      this.conns[name] = connState
     }
 
-    
-    //Apply symmetric-key ratchet on receiving chain to get message key for the received message
-    const ck_r = await HMACtoHMACKey(this.conns[name].ck_r, "ck-str");
-    const mk = await HMACtoAESKey(this.conns[name].ck_r, "mk-str");
-    
-    //update ck_r and the public key of the last sender
-    this.conns[name].ck_r = ck_r;
-    this.conns[name].seenPks.add(header.pk_sender)
-    
-    const plaintext = await decryptWithGCM(mk, ciphertext, header.receiver_iv, JSON.stringify(header));
-    return bufferToString(plaintext);
-  }
+    const connState = this.conns[name]
+    let recv_cnt = connState.recv_cnt
+    if (connState.curr_sender) {
+      if (connState.recv_pub != header.pub) {
+        const computedDH = await computeDH(connState.keypair.sec, header.pub)
+        const [next_root, recv_root] = await HKDF(connState.next_root, computedDH, 'ratchet-str')
+        connState.prev_recv_root = connState.recv_root
+        connState.prev_recv_cnt = connState.recv_cnt
+        connState.next_root = next_root
+        connState.recv_root = recv_root
+        connState.curr_sender = false
+        connState.recv_pub = header.pub
+        recv_cnt = 0
+      }
+    } else if (connState.recv_pub != header.pub) {
+      recv_cnt = connState.prev_recv_cnt
+      if (header.send_cnt < recv_cnt) {
+        const AES_key = connState.skipped[[header.pub, header.send_cnt]]
+        delete connState.skipped[[header.pub, header.send_cnt]]
+        const header_string = JSON.stringify(header)
+        const plaintext = bufferToString(await decryptWithGCM(AES_key, ciphertext, header.receiverIV, header_string))
+        return plaintext
+      } else {
+        const steps = header.send_cnt - recv_cnt
+        for (let i = 0; i < steps; i++) {
+          connState.skipped[[header.pub, recv_cnt + i]] = await HMACtoAESKey(connState.prev_recv_root, 'AES')
+          connState.prev_recv_root = await HMACtoHMACKey(connState.prev_recv_root, 'HMAC')
+        }
 
+        const AES_key = await HMACtoAESKey(connState.prev_recv_root, 'AES')
+        connState.prev_recv_root = await HMACtoHMACKey(connState.prev_recv_root, 'HMAC')
+        connState.prev_recv_cnt = header.send_cnt + 1
+
+        // decrypt
+
+        const header_string = JSON.stringify(header)
+        const plaintext = bufferToString(await decryptWithGCM(AES_key, ciphertext, header.receiverIV, header_string))
+
+        return plaintext
+      }
+    }
+
+    if (header.send_cnt < recv_cnt) {
+      const AES_key = connState.skipped[[header.pub, header.send_cnt]]
+      delete connState.skipped[[header.pub, header.send_cnt]]
+      const header_string = JSON.stringify(header)
+      const plaintext = bufferToString(await decryptWithGCM(AES_key, ciphertext, header.receiverIV, header_string))
+      return plaintext
+    }
+
+    const steps = header.send_cnt - recv_cnt
+    for (let i = 0; i < steps; i++) {
+      connState.skipped[[header.pub, recv_cnt + i]] = await HMACtoAESKey(connState.recv_root, 'AES')
+      connState.recv_root = await HMACtoHMACKey(connState.recv_root, 'HMAC')
+    }
+
+    const AES_key = await HMACtoAESKey(connState.recv_root, 'AES')
+    connState.recv_root = await HMACtoHMACKey(connState.recv_root, 'HMAC')
+    connState.recv_cnt = header.send_cnt + 1
+
+    // decrypt
+
+    const header_string = JSON.stringify(header)
+    const plaintext = bufferToString(await decryptWithGCM(AES_key, ciphertext, header.receiverIV, header_string))
+
+    return plaintext
+  }
 };
 
 module.exports = {
